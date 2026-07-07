@@ -1,8 +1,8 @@
-"""Database connection helpers.
+"""Database connection helpers."""
 
-Supabase client wiring will be added with the database services milestone.
-"""
+from app.config.settings import get_settings
 
 
 def get_database_status() -> str:
-    return "not_configured"
+    settings = get_settings()
+    return "configured" if settings.supabase_configured else "not_configured"

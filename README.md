@@ -12,6 +12,12 @@ This service will provide:
 
 ## Local Setup
 
+Create an environment file:
+
+```bash
+cp .env.example .env
+```
+
 Create a virtual environment and install dependencies:
 
 ```bash
@@ -30,6 +36,12 @@ Default local URL:
 
 ```txt
 http://localhost:8000
+```
+
+Health check:
+
+```txt
+http://localhost:8000/health
 ```
 
 ## Current Status
