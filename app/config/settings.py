@@ -9,6 +9,14 @@ class Settings(BaseSettings):
     app_version: str = "0.1.0"
     environment: str = "development"
     api_prefix: str = "/api"
+    jwt_secret_key: str = "change-this-local-development-secret"
+    jwt_algorithm: str = "HS256"
+    access_token_expire_minutes: int = 480
+
+    demo_user_email: str = "merchandiser@wfx.com"
+    demo_user_password: str = "demo1234"
+    demo_user_name: str = "WFX Merchandiser"
+    demo_user_role: str = "Merchandiser"
 
     frontend_origins: list[str] = Field(
         default_factory=lambda: [
@@ -53,6 +61,10 @@ class Settings(BaseSettings):
     @property
     def typesense_configured(self) -> bool:
         return bool(self.typesense_host and self.typesense_api_key)
+
+    @property
+    def auth_configured(self) -> bool:
+        return bool(self.jwt_secret_key and self.demo_user_email and self.demo_user_password)
 
 
 @lru_cache

@@ -2,7 +2,7 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
 from app.config.settings import get_settings
-from app.routes import ai, dashboard, products, search
+from app.routes import ai, auth, dashboard, products, search
 from app.services.embedding_service import get_embedding_status
 from app.services.supabase_service import get_supabase_status
 from app.services.typesense_service import get_typesense_status
@@ -28,6 +28,7 @@ app.include_router(dashboard.router, prefix=f"{settings.api_prefix}/dashboard", 
 app.include_router(products.router, prefix=f"{settings.api_prefix}/products", tags=["products"])
 app.include_router(ai.router, prefix=f"{settings.api_prefix}/ai", tags=["ai"])
 app.include_router(search.router, prefix=f"{settings.api_prefix}/search", tags=["search"])
+app.include_router(auth.router, prefix=f"{settings.api_prefix}/auth", tags=["auth"])
 
 
 @app.get("/")
@@ -46,6 +47,7 @@ def health() -> dict[str, object]:
         "vanna_openrouter": get_vanna_status(),
         "typesense": get_typesense_status(),
         "embeddings": get_embedding_status(),
+        "auth": "configured" if settings.auth_configured else "not_configured",
     }
 
     return {

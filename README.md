@@ -44,6 +44,27 @@ Health check:
 http://localhost:8000/health
 ```
 
+## Authentication
+
+The backend includes a demo JWT login flow for the MVP. Configure the demo user
+in `.env`, then request a token:
+
+```bash
+curl -X POST http://127.0.0.1:8000/api/auth/login \
+  -H "Content-Type: application/json" \
+  -d '{"email":"merchandiser@wfx.com","password":"demo1234"}'
+```
+
+Use the returned token for protected ERP APIs:
+
+```bash
+curl http://127.0.0.1:8000/api/dashboard/summary \
+  -H "Authorization: Bearer <access_token>"
+```
+
+This is suitable for local evaluation only. Production auth should use Supabase
+Auth or a dedicated identity provider with server-side token validation.
+
 ## Current Status
 
 The backend is scaffolded with route modules, settings, health checks, Supabase

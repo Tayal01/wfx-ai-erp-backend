@@ -2,8 +2,9 @@ from __future__ import annotations
 
 from typing import Optional
 
-from fastapi import APIRouter, HTTPException, Query
+from fastapi import APIRouter, Depends, HTTPException, Query
 
+from app.services.auth_service import get_current_user
 from app.services.supabase_service import get_product_detail, list_products
 
 
@@ -28,6 +29,7 @@ def products_index(
     fabric: Optional[str] = None,
     season: Optional[str] = None,
     supplier: Optional[str] = None,
+    _current_user: dict = Depends(get_current_user),
 ) -> dict:
     try:
         return list_products(
@@ -44,7 +46,7 @@ def products_index(
 
 
 @router.get("/{style_number}")
-def products_show(style_number: str) -> dict:
+def products_show(style_number: str, _current_user: dict = Depends(get_current_user)) -> dict:
     try:
         product = get_product_detail(style_number)
     except Exception as exc:

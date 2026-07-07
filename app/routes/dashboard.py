@@ -1,5 +1,6 @@
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, Depends, HTTPException
 
+from app.services.auth_service import get_current_user
 from app.services.supabase_service import get_dashboard_summary
 
 
@@ -16,7 +17,7 @@ def dashboard_status() -> dict[str, str]:
 
 
 @router.get("/summary")
-def dashboard_summary() -> dict:
+def dashboard_summary(_current_user: dict = Depends(get_current_user)) -> dict:
     try:
         return get_dashboard_summary()
     except Exception as exc:
