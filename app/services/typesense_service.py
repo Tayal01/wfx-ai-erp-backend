@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from functools import lru_cache
 from typing import Any, Optional
+import json
 
 import httpx
 import typesense
@@ -134,9 +135,10 @@ def _fetch_image_bytes(image_url: Optional[str]) -> Optional[bytes]:
 def _load_product_catalog(limit: int = 1500) -> list[dict[str, Any]]:
     products = list_records_selected(
         "finished_goods",
-        "style_number,style_name,category,fabric,gsm,color,print,season,brand,supplier,cost,selling_price,image_url",
+        "style_number,style_name,category,fabric,gsm,color,print,season,brand,supplier,cost,selling_price,image_url,embedding",
         limit,
     )
+
     tech_packs = list_records_selected("tech_packs", "style_number,fabric_details,construction", limit)
     tech_pack_map = {item["style_number"]: item for item in tech_packs}
 
@@ -205,17 +207,22 @@ def index_products(limit: int = 1500, include_embeddings: bool = True) -> dict[s
     documents: list[dict[str, Any]] = []
 
     for product in catalog:
-        embedding: list[float] = []
-        if include_embeddings:
+        embedding = product.get("embedding") or []
+        if isinstance(embedding, str): # for backward compatibility 
+            embedding = json.loads(embedding)
+
+        if include_embeddings and not embedding:
             image_bytes = _fetch_image_bytes(product.get("image_url"))
             embedding = get_product_embedding(product, image_bytes=image_bytes)
             _persist_embedding(product["style_number"], embedding)
+
         documents.append(_serialize_document(product, embedding))
 
     if settings.typesense_configured:
         ensure_collection()
         client = get_typesense_client()
         collection = client.collections[settings.typesense_products_collection]
+
         for document in documents:
             collection.documents.upsert(document)
 
@@ -224,8 +231,6 @@ def index_products(limit: int = 1500, include_embeddings: bool = True) -> dict[s
         "typesense": settings.typesense_configured,
         "embeddings_generated": include_embeddings,
     }
-
-
 def _format_hit(hit: dict[str, Any]) -> dict[str, Any]:
     document = hit.get("document", {})
     score = hit.get("text_match_info", {}).get("score")
@@ -325,6 +330,30 @@ def _search_products_supabase(
     }
 
 
+# def search_similar_products(
+#     embedding: list[float],
+#     *,
+#     limit: int = 12,
+# ) -> dict[str, Any]:
+#     settings = get_settings()
+#     per_page = min(max(limit, 1), 50)
+
+#     if settings.typesense_configured:
+#         ensure_collection()
+#         client = get_typesense_client()
+#         vector_query = f"embedding:([{','.join(str(value) for value in embedding)}], k:{per_page})"
+#         response = client.collections[settings.typesense_products_collection].documents.search(
+#             {
+#                 "q": "*",
+#                 "vector_query": vector_query,
+#                 "per_page": per_page,
+#             }
+#         )
+#         hits = [_format_hit(hit) for hit in response.get("hits", [])]
+#         return {"engine": "typesense", "count": len(hits), "items": hits}
+
+#     return _search_similar_supabase(embedding=embedding, limit=per_page)
+
 def search_similar_products(
     embedding: list[float],
     *,
@@ -335,20 +364,42 @@ def search_similar_products(
 
     if settings.typesense_configured:
         ensure_collection()
+
         client = get_typesense_client()
-        vector_query = f"embedding:([{','.join(str(value) for value in embedding)}], k:{per_page})"
-        response = client.collections[settings.typesense_products_collection].documents.search(
-            {
-                "q": "*",
-                "vector_query": vector_query,
-                "per_page": per_page,
-            }
+
+        vector_query = (
+            f"embedding:([{','.join(str(value) for value in embedding)}], "
+            f"k:{per_page})"
         )
-        hits = [_format_hit(hit) for hit in response.get("hits", [])]
-        return {"engine": "typesense", "count": len(hits), "items": hits}
 
-    return _search_similar_supabase(embedding=embedding, limit=per_page)
+        response = client.multi_search.perform(
+            {
+                "searches": [
+                    {
+                        "collection": settings.typesense_products_collection,
+                        "q": "*",
+                        "vector_query": vector_query,
+                        "per_page": per_page,
+                    }
+                ]
+            },
+            {},
+        )
 
+        result = response["results"][0]
+
+        hits = [_format_hit(hit) for hit in result.get("hits", [])]
+
+        return {
+            "engine": "typesense",
+            "count": len(hits),
+            "items": hits,
+        }
+
+    return _search_similar_supabase(
+        embedding=embedding,
+        limit=per_page,
+    )
 
 def _search_similar_supabase(embedding: list[float], limit: int) -> dict[str, Any]:
     settings = get_settings()
