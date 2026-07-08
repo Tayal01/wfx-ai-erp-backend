@@ -104,6 +104,13 @@ def ensure_collection() -> None:
         client.collections.create(_collection_schema(collection_name))
 
 
+def _get_collection_field_names() -> set[str]:
+    settings = get_settings()
+    client = get_typesense_client()
+    schema = client.collections[settings.typesense_products_collection].retrieve()
+    return {field["name"] for field in schema.get("fields", [])}
+
+
 def _build_search_text(product: dict[str, Any]) -> str:
     parts = [
         product.get("style_name"),
@@ -260,6 +267,28 @@ def _format_hit(hit: dict[str, Any]) -> dict[str, Any]:
     return result
 
 
+def _with_match_percent(items: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    scored_items = [item for item in items if item.get("score") is not None]
+    max_score = max((float(item["score"]) for item in scored_items), default=0.0)
+
+    for index, item in enumerate(items):
+        if item.get("similarity_percent") is not None:
+            item["match_percent"] = round(float(item["similarity_percent"]))
+            item["match_basis"] = "visual similarity"
+            continue
+
+        if max_score > 0 and item.get("score") is not None:
+            relative_score = float(item["score"]) / max_score
+            item["match_percent"] = round(max(52, min(99, 50 + (relative_score * 49))))
+            item["match_basis"] = "search relevance"
+            continue
+
+        item["match_percent"] = max(60, 92 - (index * 4))
+        item["match_basis"] = "filter match"
+
+    return items
+
+
 def _build_filter_by(filters: dict[str, Optional[str]]) -> Optional[str]:
     clauses = []
     if filters.get("gsm_min"):
@@ -306,9 +335,25 @@ def search_products(
         search_query = query or "*"
         if buyer:
             search_query = f"{search_query} {buyer}".strip() if search_query != "*" else buyer
+        searchable_fields = [
+            "style_name",
+            "search_text",
+            "category",
+            "fabric",
+            "color",
+            "print",
+            "season",
+            "brand",
+            "supplier",
+            "fabric_details",
+            "construction",
+            "buyers",
+        ]
+        collection_fields = _get_collection_field_names()
+        query_by = ",".join(field for field in searchable_fields if field in collection_fields)
         search_params: dict[str, Any] = {
             "q": search_query,
-            "query_by": "style_name,search_text,category,fabric,color,print,season,brand,supplier,fabric_details,construction,buyers",
+            "query_by": query_by,
             "per_page": min(max(limit, 1), 50),
         }
         filter_clauses = {
@@ -327,7 +372,7 @@ def search_products(
 
         response = client.collections[settings.typesense_products_collection].documents.search(search_params)
         hits = [_format_hit(hit) for hit in response.get("hits", [])]
-        return {"engine": "typesense", "query": query, "count": len(hits), "items": hits}
+        return {"engine": "typesense", "query": query, "count": len(hits), "items": _with_match_percent(hits)}
 
     return _search_products_supabase(query=query, filters=filters, limit=limit)
 
@@ -382,7 +427,7 @@ def _search_products_supabase(
         "engine": "supabase",
         "query": query,
         "count": len(items),
-        "items": items,
+        "items": _with_match_percent(items),
     }
 
 
@@ -449,7 +494,7 @@ def search_similar_products(
         return {
             "engine": "typesense",
             "count": len(hits),
-            "items": hits,
+            "items": _with_match_percent(hits),
         }
 
     return _search_similar_supabase(
@@ -501,4 +546,4 @@ def _search_similar_supabase(embedding: list[float], limit: int) -> dict[str, An
         item["similarity_percent"] = round(similarity * 100, 1)
         items.append(item)
 
-    return {"engine": "supabase", "count": len(items), "items": items}
+    return {"engine": "supabase", "count": len(items), "items": _with_match_percent(items)}
