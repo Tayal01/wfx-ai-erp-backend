@@ -75,6 +75,7 @@ def _collection_schema(collection_name: str) -> dict[str, Any]:
             {"name": "season", "type": "string", "facet": True},
             {"name": "brand", "type": "string", "facet": True},
             {"name": "supplier", "type": "string", "facet": True},
+            {"name": "buyers", "type": "string[]", "facet": True, "optional": True},
             {"name": "cost", "type": "float"},
             {"name": "selling_price", "type": "float"},
             {"name": "image_url", "type": "string", "optional": True},
@@ -142,15 +143,25 @@ def _load_product_catalog(limit: int = 1500) -> list[dict[str, Any]]:
     tech_packs = list_records_selected("tech_packs", "style_number,fabric_details,construction", limit)
     tech_pack_map = {item["style_number"]: item for item in tech_packs}
 
+    orders = list_records_selected("sales_orders", "style_number,buyer", limit * 2)
+    buyers_by_style: dict[str, set[str]] = {}
+    for order in orders:
+        style_number = order["style_number"]
+        buyers_by_style.setdefault(style_number, set()).add(order["buyer"])
+
     catalog: list[dict[str, Any]] = []
     for product in products:
         tech_pack = tech_pack_map.get(product["style_number"], {})
+        buyers = sorted(buyers_by_style.get(product["style_number"], set()))
         enriched = {
             **product,
             "fabric_details": tech_pack.get("fabric_details"),
             "construction": tech_pack.get("construction"),
+            "buyers": buyers,
         }
         enriched["search_text"] = _build_search_text(enriched)
+        if buyers:
+            enriched["search_text"] += " " + " ".join(buyers)
         catalog.append(enriched)
 
     return catalog
@@ -181,6 +192,8 @@ def _serialize_document(product: dict[str, Any], embedding: list[float]) -> dict
         document["fabric_details"] = product["fabric_details"]
     if product.get("construction"):
         document["construction"] = product["construction"]
+    if product.get("buyers"):
+        document["buyers"] = product["buyers"]
 
     return document
 
@@ -249,9 +262,14 @@ def _format_hit(hit: dict[str, Any]) -> dict[str, Any]:
 
 def _build_filter_by(filters: dict[str, Optional[str]]) -> Optional[str]:
     clauses = []
+    if filters.get("gsm_min"):
+        clauses.append(f"gsm:>={int(filters['gsm_min'])}")
+    if filters.get("gsm_max"):
+        clauses.append(f"gsm:<={int(filters['gsm_max'])}")
     for field, value in filters.items():
-        if value:
-            clauses.append(f"{field}:={value}")
+        if not value or field in {"buyer", "gsm_min", "gsm_max"}:
+            continue
+        clauses.append(f"{field}:={value}")
     return " && ".join(clauses) if clauses else None
 
 
@@ -263,6 +281,10 @@ def search_products(
     fabric: Optional[str] = None,
     season: Optional[str] = None,
     supplier: Optional[str] = None,
+    print_type: Optional[str] = None,
+    buyer: Optional[str] = None,
+    gsm_min: Optional[str] = None,
+    gsm_max: Optional[str] = None,
     limit: int = 12,
 ) -> dict[str, Any]:
     settings = get_settings()
@@ -272,17 +294,34 @@ def search_products(
         "fabric": fabric,
         "season": season,
         "supplier": supplier,
+        "print": print_type,
+        "buyer": buyer,
+        "gsm_min": gsm_min,
+        "gsm_max": gsm_max,
     }
 
     if settings.typesense_configured:
         ensure_collection()
         client = get_typesense_client()
+        search_query = query or "*"
+        if buyer:
+            search_query = f"{search_query} {buyer}".strip() if search_query != "*" else buyer
         search_params: dict[str, Any] = {
-            "q": query or "*",
-            "query_by": "style_name,search_text,category,fabric,color,print,season,brand,supplier,fabric_details,construction",
+            "q": search_query,
+            "query_by": "style_name,search_text,category,fabric,color,print,season,brand,supplier,fabric_details,construction,buyers",
             "per_page": min(max(limit, 1), 50),
         }
-        filter_by = _build_filter_by(filters)
+        filter_clauses = {
+            "category": category,
+            "color": color,
+            "fabric": fabric,
+            "season": season,
+            "supplier": supplier,
+            "print": print_type,
+            "gsm_min": gsm_min,
+            "gsm_max": gsm_max,
+        }
+        filter_by = _build_filter_by(filter_clauses)
         if filter_by:
             search_params["filter_by"] = filter_by
 
@@ -316,12 +355,29 @@ def _search_products_supabase(
                 )
             )
         for field, value in filters.items():
-            if value:
-                request = request.ilike(field, f"%{value}%")
+            if not value:
+                continue
+            if field in {"gsm_min", "gsm_max", "buyer"}:
+                continue
+            request = request.ilike(field, f"%{value}%")
+        if filters.get("gsm_min"):
+            request = request.gte("gsm", int(filters["gsm_min"]))
+        if filters.get("gsm_max"):
+            request = request.lte("gsm", int(filters["gsm_max"]))
         return request.execute()
 
     response = execute_query(build_query)
     items = response.data or []
+
+    if filters.get("buyer"):
+        buyer_query = filters["buyer"].lower()
+        style_numbers = {
+            order["style_number"]
+            for order in list_records_selected("sales_orders", "style_number,buyer", 3000)
+            if buyer_query in str(order.get("buyer", "")).lower()
+        }
+        items = [item for item in items if item["style_number"] in style_numbers]
+
     return {
         "engine": "supabase",
         "query": query,

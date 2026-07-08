@@ -254,7 +254,21 @@ def list_products(
     fabric: str | None = None,
     season: str | None = None,
     supplier: str | None = None,
+    sort_by: str = "style_number",
+    sort_order: str = "asc",
 ) -> dict[str, Any]:
+    allowed_sort_fields = {
+        "style_number",
+        "style_name",
+        "selling_price",
+        "cost",
+        "gsm",
+        "season",
+        "category",
+    }
+    sort_field = sort_by if sort_by in allowed_sort_fields else "style_number"
+    descending = sort_order.lower() == "desc"
+
     page = max(page, 1)
     page_size = min(max(page_size, 1), 100)
     start = (page - 1) * page_size
@@ -267,12 +281,13 @@ def list_products(
         "season": season,
         "supplier": supplier,
     }
+
     def build_query(client: Client):
         query = client.table("finished_goods").select("*", count="exact")
         for field, value in filters.items():
             if value:
                 query = query.ilike(field, f"%{value}%")
-        return query.order("style_number").range(start, end).execute()
+        return query.order(sort_field, desc=descending).range(start, end).execute()
 
     response = execute_query(build_query)
 
@@ -281,6 +296,8 @@ def list_products(
         "page": page,
         "page_size": page_size,
         "total": int(response.count or 0),
+        "sort_by": sort_field,
+        "sort_order": "desc" if descending else "asc",
     }
 
 

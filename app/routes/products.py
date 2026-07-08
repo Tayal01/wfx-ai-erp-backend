@@ -29,6 +29,8 @@ def products_index(
     fabric: Optional[str] = None,
     season: Optional[str] = None,
     supplier: Optional[str] = None,
+    sort_by: str = Query(default="style_number"),
+    sort_order: str = Query(default="asc", pattern="^(asc|desc)$"),
     _current_user: dict = Depends(get_current_user),
 ) -> dict:
     try:
@@ -40,6 +42,8 @@ def products_index(
             fabric=fabric,
             season=season,
             supplier=supplier,
+            sort_by=sort_by,
+            sort_order=sort_order,
         )
     except Exception as exc:
         raise HTTPException(status_code=502, detail=f"Unable to load products: {exc}") from exc
