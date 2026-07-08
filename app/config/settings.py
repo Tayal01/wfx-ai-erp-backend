@@ -39,7 +39,7 @@ class Settings(BaseSettings):
     typesense_api_key: str = ""
     typesense_products_collection: str = "wfx_products"
 
-    embedding_model_name: str = "openai/clip-vit-base-patch32"
+    embedding_model_name: str = "clip-ViT-B-32"
 
     model_config = SettingsConfigDict(
         env_file=".env",

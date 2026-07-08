@@ -1,6 +1,8 @@
 -- WFX AI ERP Assistant - Supabase PostgreSQL schema
 -- Run this in Supabase SQL Editor before importing CSV data.
 
+create extension if not exists vector;
+
 create table if not exists buyers (
     buyer_id text primary key,
     company_name text not null unique,
@@ -33,8 +35,10 @@ create table if not exists finished_goods (
     cost numeric(12, 2) not null check (cost >= 0),
     selling_price numeric(12, 2) not null check (selling_price >= 0),
     image_url text,
+    embedding vector(512),
     created_at timestamptz not null default now()
 );
+
 
 create table if not exists sales_orders (
     order_number text primary key,

@@ -67,9 +67,9 @@ Auth or a dedicated identity provider with server-side token validation.
 
 ## Current Status
 
-The backend is scaffolded with route modules, settings, health checks, Supabase
-schema, and CSV import tooling. Runtime service integrations will be expanded in
-later milestones.
+The backend includes dashboard/product APIs, JWT auth, OpenRouter NL-to-SQL assistant,
+Typesense text search, CLIP image similarity search, and Supabase/pgvector fallbacks.
+Run the product indexing script after configuring Supabase and Typesense.
 
 ## Supabase Database Setup
 
@@ -114,3 +114,43 @@ Expected row counts:
 - sales_orders: 1500
 - sales_invoices: 1206
 - tech_packs: 1000
+
+## Typesense Cloud Setup
+
+You do **not** need to manually create the collection in the Typesense dashboard. The backend
+creates the `wfx_products` collection automatically during indexing.
+
+Set cloud credentials in `.env`:
+
+```env
+TYPESENSE_HOST="your-cluster-id.a1.typesense.net"
+TYPESENSE_PORT=443
+TYPESENSE_PROTOCOL="https"
+TYPESENSE_API_KEY="your-typesense-api-key"
+TYPESENSE_PRODUCTS_COLLECTION="wfx_products"
+EMBEDDING_MODEL_NAME="clip-ViT-B-32"
+```
+
+Build the product index and embeddings:
+
+```bash
+python scripts/index_products.py
+```
+
+Or trigger reindex through the API after signing in:
+
+```bash
+curl -X POST http://127.0.0.1:8000/api/search/reindex \
+  -H "Authorization: Bearer <access_token>" \
+  -H "Content-Type: application/json" \
+  -d '{"limit":1500,"include_embeddings":true}'
+```
+
+Search endpoints:
+
+- `POST /api/search/products` for intelligent text search
+- `POST /api/search/image` for uploaded image similarity search
+- `POST /api/search/image-url` for image URL similarity search
+
+If Typesense is unavailable, search routes fall back to Supabase text search and Postgres
+pgvector similarity search when embeddings are stored in `finished_goods.embedding`.
