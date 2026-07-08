@@ -25,7 +25,13 @@ class ProductSearchRequest(BaseModel):
     fabric: Optional[str] = None
     season: Optional[str] = None
     supplier: Optional[str] = None
+    print_type: Optional[str] = Field(default=None, alias="print")
+    buyer: Optional[str] = None
+    gsm_min: Optional[str] = None
+    gsm_max: Optional[str] = None
     limit: int = Field(default=12, ge=1, le=50)
+
+    model_config = {"populate_by_name": True}
 
 
 class ImageSearchRequest(BaseModel):
@@ -68,6 +74,10 @@ def product_search(
             fabric=payload.fabric,
             season=payload.season,
             supplier=payload.supplier,
+            print_type=payload.print_type,
+            buyer=payload.buyer,
+            gsm_min=payload.gsm_min,
+            gsm_max=payload.gsm_max,
             limit=payload.limit,
         )
     except RuntimeError as exc:
