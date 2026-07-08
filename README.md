@@ -85,7 +85,14 @@ Set local credentials in `.env`:
 SUPABASE_URL="your-project-url"
 SUPABASE_SERVICE_ROLE_KEY="your-service-role-key"
 SUPABASE_ANON_KEY="your-anon-key"
+DATABASE_URL="your-supabase-postgres-connection-string"
+OPENROUTER_API_KEY="your-openrouter-api-key"
 ```
+
+For the AI assistant route, `DATABASE_URL` should be the direct Supabase Postgres
+connection string, not the project dashboard URL. The `/api/ai/chat` endpoint
+uses OpenRouter to generate safe `SELECT` SQL, validates the query, executes it
+against Postgres, and returns rows plus a business summary.
 
 Validate CSV files without writing to Supabase:
 

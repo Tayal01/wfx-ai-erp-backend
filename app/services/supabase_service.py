@@ -2,12 +2,24 @@ from __future__ import annotations
 
 """Supabase data access service."""
 
+from concurrent.futures import ThreadPoolExecutor
 from functools import lru_cache
-from typing import Any
+import time
+from typing import Any, Optional
 
 from supabase import Client, create_client
 
 from app.config.settings import get_settings
+
+
+DASHBOARD_SUMMARY_TTL_SECONDS = 30
+PRODUCT_DETAIL_TTL_SECONDS = 120
+SUMMARY_QUERY_WORKERS = 6
+_dashboard_summary_cache: dict[str, Any] = {
+    "value": None,
+    "timestamp": 0.0,
+}
+_product_detail_cache: dict[str, dict[str, Any]] = {}
 
 
 def get_supabase_status() -> str:
@@ -24,13 +36,53 @@ def get_supabase_client() -> Client:
     return create_client(settings.supabase_url, settings.supabase_service_role_key)
 
 
+def is_transient_supabase_error(error: Exception) -> bool:
+    message = str(error).lower()
+    if "resource temporarily unavailable" in message:
+        return True
+    if "temporary failure" in message:
+        return True
+    if "connection reset" in message:
+        return True
+    if "connection aborted" in message:
+        return True
+    if "timed out" in message:
+        return True
+    if "network" in message and "error" in message:
+        return True
+    return isinstance(error, OSError)
+
+
+def execute_query(query_factory, retries: int = 3):
+    last_error: Optional[Exception] = None
+
+    for attempt in range(retries):
+        try:
+            return query_factory(get_supabase_client())
+        except Exception as exc:  # noqa: BLE001
+            last_error = exc
+            if not is_transient_supabase_error(exc) or attempt == retries - 1:
+                raise
+
+            get_supabase_client.cache_clear()
+            time.sleep(0.25 * (attempt + 1))
+
+    raise last_error or RuntimeError("Supabase query failed.")
+
+
 def list_records(table: str, limit: int = 1000) -> list[dict[str, Any]]:
+    return list_records_selected(table=table, columns="*", limit=limit)
+
+
+def list_records_selected(table: str, columns: str, limit: int = 1000) -> list[dict[str, Any]]:
     records: list[dict[str, Any]] = []
     page_size = 1000
 
     for start in range(0, limit, page_size):
         end = min(start + page_size - 1, limit - 1)
-        response = get_supabase_client().table(table).select("*").range(start, end).execute()
+        response = execute_query(
+            lambda client: client.table(table).select(columns).range(start, end).execute()
+        )
         batch = response.data or []
         records.extend(batch)
 
@@ -41,16 +93,88 @@ def list_records(table: str, limit: int = 1000) -> list[dict[str, Any]]:
 
 
 def count_records(table: str) -> int:
-    response = get_supabase_client().table(table).select("*", count="exact").limit(1).execute()
+    response = execute_query(
+        lambda client: client.table(table).select("*", count="exact").limit(1).execute()
+    )
     return int(response.count or 0)
 
 
+def fetch_records(
+    table: str,
+    columns: str = "*",
+    limit: int = 10,
+    order_by: Optional[str] = None,
+    descending: bool = False,
+) -> list[dict[str, Any]]:
+    def build_query(client: Client):
+        query = client.table(table).select(columns).limit(limit)
+        if order_by:
+            query = query.order(order_by, desc=descending)
+        return query.execute()
+
+    response = execute_query(build_query)
+    return response.data or []
+
+
 def get_dashboard_summary() -> dict[str, Any]:
-    buyers = list_records("buyers", limit=200)
-    suppliers = list_records("suppliers", limit=200)
-    products = list_records("finished_goods", limit=1500)
-    orders = list_records("sales_orders", limit=2500)
-    invoices = list_records("sales_invoices", limit=2500)
+    now = time.time()
+    cached_value = _dashboard_summary_cache["value"]
+    cached_timestamp = _dashboard_summary_cache["timestamp"]
+
+    if cached_value and (now - cached_timestamp) < DASHBOARD_SUMMARY_TTL_SECONDS:
+        return cached_value
+
+    with ThreadPoolExecutor(max_workers=SUMMARY_QUERY_WORKERS) as executor:
+        buyers_count_future = executor.submit(count_records, "buyers")
+        suppliers_count_future = executor.submit(count_records, "suppliers")
+        products_count_future = executor.submit(count_records, "finished_goods")
+        orders_count_future = executor.submit(count_records, "sales_orders")
+        invoices_count_future = executor.submit(count_records, "sales_invoices")
+        products_future = executor.submit(
+            list_records_selected,
+            "finished_goods",
+            "style_number,style_name,category",
+            1500,
+        )
+        orders_future = executor.submit(
+            list_records_selected,
+            "sales_orders",
+            "order_number,buyer,style_number,quantity,unit_price,status",
+            2500,
+        )
+        invoices_future = executor.submit(
+            list_records_selected,
+            "sales_invoices",
+            "amount,payment_status",
+            2500,
+        )
+        recent_orders_future = executor.submit(
+            fetch_records,
+            "sales_orders",
+            "order_number,buyer,style_number,quantity,status,shipment_date",
+            10,
+            "shipment_date",
+            True,
+        )
+        recent_products_future = executor.submit(
+            fetch_records,
+            "finished_goods",
+            "style_number,style_name,category,color,fabric,season,supplier",
+            10,
+            "created_at",
+            True,
+        )
+
+        buyers_count = buyers_count_future.result()
+        suppliers_count = suppliers_count_future.result()
+        products_count = products_count_future.result()
+        orders_count = orders_count_future.result()
+        invoices_count = invoices_count_future.result()
+        products = products_future.result()
+        orders = orders_future.result()
+        invoices = invoices_future.result()
+        recent_orders = recent_orders_future.result()
+        recent_products = recent_products_future.result()
 
     order_revenue = sum(float(order["quantity"]) * float(order["unit_price"]) for order in orders)
     invoice_amount = sum(float(invoice["amount"]) for invoice in invoices)
@@ -81,13 +205,13 @@ def get_dashboard_summary() -> dict[str, Any]:
         status = order["status"]
         order_status_counts[status] = order_status_counts.get(status, 0) + 1
 
-    return {
+    summary = {
         "kpis": {
-            "buyers": len(buyers),
-            "suppliers": len(suppliers),
-            "finished_goods": len(products),
-            "sales_orders": len(orders),
-            "sales_invoices": len(invoices),
+            "buyers": buyers_count,
+            "suppliers": suppliers_count,
+            "finished_goods": products_count,
+            "sales_orders": orders_count,
+            "sales_invoices": invoices_count,
             "estimated_order_revenue": round(order_revenue, 2),
             "invoice_amount": round(invoice_amount, 2),
             "pending_invoice_amount": round(pending_invoice_amount, 2),
@@ -111,10 +235,15 @@ def get_dashboard_summary() -> dict[str, Any]:
             ],
         },
         "recent": {
-            "orders": orders[:10],
-            "products": products[:10],
+            "orders": recent_orders,
+            "products": recent_products,
         },
     }
+
+    _dashboard_summary_cache["value"] = summary
+    _dashboard_summary_cache["timestamp"] = now
+
+    return summary
 
 
 def list_products(
@@ -131,7 +260,6 @@ def list_products(
     start = (page - 1) * page_size
     end = start + page_size - 1
 
-    query = get_supabase_client().table("finished_goods").select("*", count="exact")
     filters = {
         "category": category,
         "color": color,
@@ -139,12 +267,14 @@ def list_products(
         "season": season,
         "supplier": supplier,
     }
+    def build_query(client: Client):
+        query = client.table("finished_goods").select("*", count="exact")
+        for field, value in filters.items():
+            if value:
+                query = query.ilike(field, f"%{value}%")
+        return query.order("style_number").range(start, end).execute()
 
-    for field, value in filters.items():
-        if value:
-            query = query.ilike(field, f"%{value}%")
-
-    response = query.order("style_number").range(start, end).execute()
+    response = execute_query(build_query)
 
     return {
         "items": response.data or [],
@@ -155,9 +285,13 @@ def list_products(
 
 
 def get_product_detail(style_number: str) -> dict[str, Any] | None:
-    product_response = (
-        get_supabase_client()
-        .table("finished_goods")
+    now = time.time()
+    cached_entry = _product_detail_cache.get(style_number)
+    if cached_entry and (now - cached_entry["timestamp"]) < PRODUCT_DETAIL_TTL_SECONDS:
+        return cached_entry["value"]
+
+    product_response = execute_query(
+        lambda client: client.table("finished_goods")
         .select("*")
         .eq("style_number", style_number)
         .limit(1)
@@ -168,55 +302,60 @@ def get_product_detail(style_number: str) -> dict[str, Any] | None:
         return None
 
     product = products[0]
-    tech_pack = (
-        get_supabase_client()
-        .table("tech_packs")
-        .select("*")
-        .eq("style_number", style_number)
-        .limit(1)
-        .execute()
-        .data
-        or []
-    )
-    supplier = (
-        get_supabase_client()
-        .table("suppliers")
-        .select("*")
-        .eq("company_name", product["supplier"])
-        .limit(1)
-        .execute()
-        .data
-        or []
-    )
-    orders = (
-        get_supabase_client()
-        .table("sales_orders")
-        .select("*")
-        .eq("style_number", style_number)
-        .order("shipment_date", desc=True)
-        .limit(20)
-        .execute()
-        .data
-        or []
-    )
+    with ThreadPoolExecutor(max_workers=3) as executor:
+        tech_pack_future = executor.submit(
+            execute_query,
+            lambda client: client.table("tech_packs")
+            .select("*")
+            .eq("style_number", style_number)
+            .limit(1)
+            .execute(),
+        )
+        supplier_future = executor.submit(
+            execute_query,
+            lambda client: client.table("suppliers")
+            .select("*")
+            .eq("company_name", product["supplier"])
+            .limit(1)
+            .execute(),
+        )
+        orders_future = executor.submit(
+            execute_query,
+            lambda client: client.table("sales_orders")
+            .select("*")
+            .eq("style_number", style_number)
+            .order("shipment_date", desc=True)
+            .limit(20)
+            .execute(),
+        )
+
+        tech_pack = tech_pack_future.result().data or []
+        supplier = supplier_future.result().data or []
+        orders = orders_future.result().data or []
+
     order_numbers = [order["order_number"] for order in orders]
     invoices: list[dict[str, Any]] = []
     if order_numbers:
-        invoices = (
-            get_supabase_client()
-            .table("sales_invoices")
+        invoices_response = execute_query(
+            lambda client: client.table("sales_invoices")
             .select("*")
             .in_("sales_order", order_numbers)
             .limit(50)
             .execute()
-            .data
-            or []
         )
+        invoices = invoices_response.data or []
 
-    return {
+    detail = {
         "product": product,
         "tech_pack": tech_pack[0] if tech_pack else None,
         "supplier": supplier[0] if supplier else None,
         "orders": orders,
         "invoices": invoices,
     }
+
+    _product_detail_cache[style_number] = {
+        "value": detail,
+        "timestamp": now,
+    }
+
+    return detail

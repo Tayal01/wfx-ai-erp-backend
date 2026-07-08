@@ -28,6 +28,7 @@ class Settings(BaseSettings):
     supabase_url: str = ""
     supabase_service_role_key: str = ""
     supabase_anon_key: str = ""
+    database_url: str = ""
 
     openrouter_api_key: str = ""
     openrouter_model: str = "openai/gpt-4o-mini"
@@ -65,6 +66,10 @@ class Settings(BaseSettings):
     @property
     def auth_configured(self) -> bool:
         return bool(self.jwt_secret_key and self.demo_user_email and self.demo_user_password)
+
+    @property
+    def database_configured(self) -> bool:
+        return bool(self.database_url)
 
 
 @lru_cache
