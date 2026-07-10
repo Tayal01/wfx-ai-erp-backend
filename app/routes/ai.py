@@ -1,10 +1,13 @@
 from __future__ import annotations
 
+import json
+
 from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
 
 from app.services.auth_service import get_current_user
-from app.services.vanna_service import answer_erp_question, get_vanna_status
+from app.services.vanna_service import answer_erp_question, get_vanna_status, stream_erp_answer
 
 
 router = APIRouter()
@@ -60,3 +63,26 @@ def ai_chat(
             status_code=status.HTTP_502_BAD_GATEWAY,
             detail=f"Unable to answer ERP question: {exc}",
         ) from exc
+
+
+@router.post("/chat/stream")
+def ai_chat_stream(
+    payload: AIChatRequest,
+    _current_user: dict = Depends(get_current_user),
+) -> StreamingResponse:
+    def event_stream():
+        try:
+            for event, data in stream_erp_answer(payload.question):
+                yield f"event: {event}\ndata: {json.dumps(data, default=str)}\n\n"
+        except ValueError as exc:
+            yield f"event: error\ndata: {json.dumps({'detail': str(exc)})}\n\n"
+        except RuntimeError as exc:
+            yield f"event: error\ndata: {json.dumps({'detail': str(exc)})}\n\n"
+        except Exception as exc:  # noqa: BLE001
+            yield f"event: error\ndata: {json.dumps({'detail': f'Unable to answer ERP question: {exc}'})}\n\n"
+
+    return StreamingResponse(
+        event_stream(),
+        media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+    )

@@ -1,59 +1,63 @@
 from __future__ import annotations
 
-from datetime import datetime, timedelta
+"""Authentication via Supabase Auth.
+
+The frontend signs in directly against Supabase and sends the resulting access
+token as a bearer credential. Here we verify that token by asking Supabase Auth
+who it belongs to (`auth.get_user`), with a short in-memory cache so we don't hit
+Supabase on every request.
+"""
+
+import time
 from typing import Any, Optional
 
-import jwt
 from fastapi import Depends, HTTPException, status
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 
-from app.config.settings import get_settings
+from app.services.supabase_service import get_supabase_client
 
 
 bearer_scheme = HTTPBearer(auto_error=False)
 
+_TOKEN_CACHE_TTL_SECONDS = 300
+_token_cache: dict[str, tuple[dict[str, str], float]] = {}
 
-def authenticate_user(email: str, password: str) -> dict[str, str] | None:
-    settings = get_settings()
 
-    if email != settings.demo_user_email or password != settings.demo_user_password:
-        return None
-
+def _map_supabase_user(supabase_user: Any) -> dict[str, str]:
+    metadata = getattr(supabase_user, "user_metadata", None) or {}
+    email = getattr(supabase_user, "email", "") or ""
     return {
-        "email": settings.demo_user_email,
-        "name": settings.demo_user_name,
-        "role": settings.demo_user_role,
+        "id": str(getattr(supabase_user, "id", "")),
+        "email": email,
+        "name": metadata.get("name") or metadata.get("full_name") or email or "User",
+        "role": metadata.get("role") or "Merchandiser",
     }
 
 
-def create_access_token(user: dict[str, str]) -> str:
-    settings = get_settings()
-    expires_at = datetime.utcnow() + timedelta(minutes=settings.access_token_expire_minutes)
-    payload: dict[str, Any] = {
-        "sub": user["email"],
-        "name": user["name"],
-        "role": user["role"],
-        "exp": expires_at,
-        "iat": datetime.utcnow(),
-    }
+def verify_supabase_token(token: str) -> dict[str, str]:
+    now = time.time()
+    cached = _token_cache.get(token)
+    if cached and cached[1] > now:
+        return cached[0]
 
-    return jwt.encode(payload, settings.jwt_secret_key, algorithm=settings.jwt_algorithm)
-
-
-def decode_access_token(token: str) -> dict[str, Any]:
-    settings = get_settings()
     try:
-        return jwt.decode(token, settings.jwt_secret_key, algorithms=[settings.jwt_algorithm])
-    except jwt.ExpiredSignatureError as exc:
+        response = get_supabase_client().auth.get_user(token)
+    except Exception as exc:  # noqa: BLE001 - any failure means the token is not usable
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Access token has expired",
+            detail="Invalid or expired session",
         ) from exc
-    except jwt.InvalidTokenError as exc:
+
+    supabase_user = getattr(response, "user", None)
+    if supabase_user is None:
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Invalid access token",
-        ) from exc
+            detail="Invalid or expired session",
+        )
+
+    user = _map_supabase_user(supabase_user)
+    _token_cache[token] = (user, now + _TOKEN_CACHE_TTL_SECONDS)
+    return user
 
 
 def get_current_user(
@@ -65,9 +69,4 @@ def get_current_user(
             detail="Missing bearer token",
         )
 
-    payload = decode_access_token(credentials.credentials)
-    return {
-        "email": str(payload["sub"]),
-        "name": str(payload.get("name", "")),
-        "role": str(payload.get("role", "")),
-    }
+    return verify_supabase_token(credentials.credentials)

@@ -9,6 +9,8 @@ python-dotenv>=1.0.1
 supabase>=2.10.0
 typesense>=0.21.0
 
+vanna[chromadb,openai]==0.7.5
+
 python-multipart>=0.0.20
 httpx>=0.27.2
 

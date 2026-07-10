@@ -11,6 +11,7 @@ from sqlalchemy import create_engine, text
 from sqlalchemy.engine import Engine
 
 from app.config.settings import get_settings
+from app.services.vanna_training import VANNA_DOCUMENTATION, VANNA_EXAMPLES
 
 
 ALLOWED_TABLES = {
@@ -23,6 +24,8 @@ ALLOWED_TABLES = {
 }
 MAX_RESULT_ROWS = 100
 OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions"
+OPENROUTER_API_BASE = "https://openrouter.ai/api/v1"
+VANNA_CHROMA_PATH = str(Path(__file__).resolve().parents[2] / ".vanna_chroma")
 SQL_BLOCKLIST = (
     "insert",
     "update",
@@ -170,33 +173,69 @@ def _post_openrouter(messages: list[dict[str, str]], temperature: float = 0.1) -
     return str(choices[0]["message"]["content"])
 
 
+def _build_vanna():
+    """Compose Vanna from a ChromaDB vector store (RAG) + OpenRouter as the LLM.
+
+    Imports are local so the rest of this module still loads if the optional
+    Vanna/ChromaDB extras are not installed in a given environment.
+    """
+    from openai import OpenAI
+    from vanna.chromadb import ChromaDB_VectorStore
+    from vanna.openai import OpenAI_Chat
+
+    settings = get_settings()
+
+    class WFXVanna(ChromaDB_VectorStore, OpenAI_Chat):
+        def __init__(self) -> None:
+            ChromaDB_VectorStore.__init__(self, config={"path": VANNA_CHROMA_PATH})
+            OpenAI_Chat.__init__(
+                self,
+                client=OpenAI(base_url=OPENROUTER_API_BASE, api_key=settings.openrouter_api_key),
+                config={"model": settings.openrouter_model, "temperature": 0.0},
+            )
+
+    return WFXVanna()
+
+
+def _is_trained(vanna: Any) -> bool:
+    try:
+        existing = vanna.get_training_data()
+    except Exception:  # noqa: BLE001 - treat any lookup failure as "not trained"
+        return False
+    return existing is not None and len(existing) > 0
+
+
+def _train_vanna(vanna: Any) -> None:
+    vanna.train(ddl=get_schema_context())
+    for documentation in VANNA_DOCUMENTATION:
+        vanna.train(documentation=documentation)
+    for question, sql in VANNA_EXAMPLES:
+        vanna.train(question=question, sql=sql)
+
+
+@lru_cache
+def get_vanna() -> Any:
+    settings = get_settings()
+    if not settings.openrouter_configured:
+        raise RuntimeError("OPENROUTER_API_KEY is not configured.")
+
+    vanna = _build_vanna()
+    if not _is_trained(vanna):
+        _train_vanna(vanna)
+    return vanna
+
+
 def generate_sql(question: str) -> str:
-    schema = get_schema_context()
-    prompt = [
-        {
-            "role": "system",
-            "content": (
-                "You are a senior SQL analyst for an apparel ERP. "
-                "Return only one PostgreSQL SELECT query. "
-                "Use only these tables: buyers, suppliers, finished_goods, sales_orders, sales_invoices, tech_packs. "
-                "Do not write explanations, markdown, comments, or multiple statements."
-            ),
-        },
-        {
-            "role": "user",
-            "content": (
-                f"Database schema:\n{schema}\n\n"
-                f"Question:\n{question}\n\n"
-                "Return SQL only."
-            ),
-        },
-    ]
-    return _post_openrouter(prompt, temperature=0.0)
+    """Generate SQL with Vanna: RAG over the trained schema + example queries,
+    with OpenRouter as the underlying LLM."""
+    vanna = get_vanna()
+    sql = vanna.generate_sql(question=question, allow_llm_to_see_data=False)
+    return str(sql or "")
 
 
-def summarize_result(question: str, sql: str, rows: list[dict[str, Any]]) -> str:
+def _summary_messages(question: str, sql: str, rows: list[dict[str, Any]]) -> list[dict[str, str]]:
     preview = json.dumps(rows[:10], ensure_ascii=True, default=str)
-    prompt = [
+    return [
         {
             "role": "system",
             "content": (
@@ -214,7 +253,49 @@ def summarize_result(question: str, sql: str, rows: list[dict[str, Any]]) -> str
             ),
         },
     ]
-    return _post_openrouter(prompt, temperature=0.2)
+
+
+def summarize_result(question: str, sql: str, rows: list[dict[str, Any]]) -> str:
+    return _post_openrouter(_summary_messages(question, sql, rows), temperature=0.2)
+
+
+def stream_summary(question: str, sql: str, rows: list[dict[str, Any]]):
+    """Yield the business summary token-by-token using OpenRouter streaming."""
+    from openai import OpenAI
+
+    settings = get_settings()
+    client = OpenAI(base_url=OPENROUTER_API_BASE, api_key=settings.openrouter_api_key)
+    stream = client.chat.completions.create(
+        model=settings.openrouter_model,
+        messages=_summary_messages(question, sql, rows),
+        temperature=0.2,
+        stream=True,
+    )
+    for chunk in stream:
+        try:
+            delta = chunk.choices[0].delta.content
+        except (AttributeError, IndexError, KeyError):
+            delta = None
+        if delta:
+            yield delta
+
+
+def stream_erp_answer(question: str):
+    """Drive the full NL->SQL flow, yielding (event, data) tuples for SSE:
+    status -> sql -> rows -> summary(deltas) -> done."""
+    yield ("status", {"step": "generating_sql"})
+    sql = generate_sql(question)
+    result = execute_safe_sql(sql)  # validates (read-only) and runs
+
+    yield ("sql", {"sql": result["sql"]})
+    yield ("status", {"step": "running_query"})
+    yield ("rows", {"rows": result["rows"], "row_count": result["row_count"]})
+
+    yield ("status", {"step": "summarizing"})
+    for delta in stream_summary(question, result["sql"], result["rows"]):
+        yield ("summary", {"delta": delta})
+
+    yield ("done", {"row_count": result["row_count"]})
 
 
 def answer_erp_question(question: str) -> dict[str, Any]:
