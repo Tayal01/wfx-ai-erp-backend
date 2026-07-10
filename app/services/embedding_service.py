@@ -40,6 +40,10 @@ def embed_text(text: str) -> list[float]:
 def embed_image_bytes(image_bytes: bytes) -> list[float]:
     model = get_embedding_model()
     image = Image.open(BytesIO(image_bytes)).convert("RGB")
+    # CLIP resizes to 224px internally; pre-shrink very large uploads so decoding a
+    # multi-megapixel phone photo doesn't dominate the request. thumbnail() only
+    # ever downsizes and preserves aspect ratio.
+    image.thumbnail((768, 768))
     vector = model.encode(image, normalize_embeddings=True)
     return _normalize_vector(vector.tolist())
 
