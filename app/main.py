@@ -15,28 +15,31 @@ settings = get_settings()
 
 
 def _warmup_models() -> None:
-    """Load heavy models once at boot so the first user request is fast.
+    """Warm models once at boot so the first user request is fast.
 
     Runs in a background thread so startup (and the platform health check) is not
-    blocked by the ~600MB CLIP model load / first-time download.
+    blocked. The CLIP image model (~440MB) is opt-in: warming it on a small host
+    would OOM the container at boot and take the whole API down, so it defaults off.
     """
-    try:
-        from app.services.embedding_service import get_embedding_model
+    if settings.warmup_vanna_on_startup:
+        try:
+            from app.services.vanna_service import get_vanna
 
-        get_embedding_model()  # CLIP for image search — the slow one to cold-load
-    except Exception:  # noqa: BLE001 - warmup is best-effort; never crash boot
-        pass
-    try:
-        from app.services.vanna_service import get_vanna
+            get_vanna()  # trains the in-memory NL->SQL store (instant, no download)
+        except Exception:  # noqa: BLE001 - warmup is best-effort; never crash boot
+            pass
+    if settings.warmup_image_model_on_startup:
+        try:
+            from app.services.embedding_service import get_embedding_model
 
-        get_vanna()  # trains the in-memory NL->SQL store (instant, no download)
-    except Exception:  # noqa: BLE001
-        pass
+            get_embedding_model()  # CLIP for image search — ~440MB, only where memory allows
+        except Exception:  # noqa: BLE001
+            pass
 
 
 @asynccontextmanager
 async def lifespan(_app: FastAPI):
-    if settings.warmup_models_on_startup:
+    if settings.warmup_vanna_on_startup or settings.warmup_image_model_on_startup:
         threading.Thread(target=_warmup_models, name="model-warmup", daemon=True).start()
     yield
 
