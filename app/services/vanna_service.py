@@ -25,7 +25,6 @@ ALLOWED_TABLES = {
 MAX_RESULT_ROWS = 100
 OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions"
 OPENROUTER_API_BASE = "https://openrouter.ai/api/v1"
-VANNA_CHROMA_PATH = str(Path(__file__).resolve().parents[2] / ".vanna_chroma")
 SQL_BLOCKLIST = (
     "insert",
     "update",
@@ -174,20 +173,25 @@ def _post_openrouter(messages: list[dict[str, str]], temperature: float = 0.1) -
 
 
 def _build_vanna():
-    """Compose Vanna from a ChromaDB vector store (RAG) + OpenRouter as the LLM.
+    """Compose Vanna from our in-memory vector store (RAG) + OpenRouter as the LLM.
+
+    The store implements Vanna's VannaBase interface with lexical retrieval sized
+    to our small curated corpus - no ChromaDB/onnxruntime, so it stays within the
+    memory budget of small hosts and has no cold-start model download.
 
     Imports are local so the rest of this module still loads if the optional
-    Vanna/ChromaDB extras are not installed in a given environment.
+    Vanna extras are not installed in a given environment.
     """
     from openai import OpenAI
-    from vanna.chromadb import ChromaDB_VectorStore
     from vanna.openai import OpenAI_Chat
+
+    from app.services.vanna_store import InMemoryVectorStore
 
     settings = get_settings()
 
-    class WFXVanna(ChromaDB_VectorStore, OpenAI_Chat):
+    class WFXVanna(InMemoryVectorStore, OpenAI_Chat):
         def __init__(self) -> None:
-            ChromaDB_VectorStore.__init__(self, config={"path": VANNA_CHROMA_PATH})
+            InMemoryVectorStore.__init__(self, config={"n_results_sql": 5})
             OpenAI_Chat.__init__(
                 self,
                 client=OpenAI(base_url=OPENROUTER_API_BASE, api_key=settings.openrouter_api_key),

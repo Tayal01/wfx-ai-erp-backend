@@ -4,7 +4,7 @@ from __future__ import annotations
 
     .venv/bin/python scripts/verify_vanna.py "Who are my top three buyers?"
 
-Shows the class hierarchy (must include Vanna's ChromaDB_VectorStore + OpenAI_Chat),
+Shows the class hierarchy (must include Vanna's VannaBase-derived store + OpenAI_Chat),
 the training row count, the examples Vanna retrieves for the question (the RAG step),
 and the SQL it generates.
 """
@@ -25,7 +25,7 @@ def main() -> None:
 
     print("Class :", type(vanna).__name__)
     print("MRO   :", " <- ".join(c.__name__ for c in type(vanna).__mro__ if c.__name__ != "object"))
-    print("Store :", "ChromaDB @", vs.VANNA_CHROMA_PATH)
+    print("Store :", "in-memory lexical retrieval (VannaBase interface)")
     print("Trained rows:", len(vanna.get_training_data()))
 
     print(f"\nQuestion: {question}")
