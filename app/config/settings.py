@@ -38,13 +38,6 @@ class Settings(BaseSettings):
 
     embedding_model_name: str = "clip-ViT-B-32"
 
-    # Warm the lightweight NL->SQL store at boot (cheap, safe) so the first AI
-    # question is instant.
-    warmup_vanna_on_startup: bool = True
-    # Warm the CLIP image model at boot. OFF by default: it needs ~440MB resident
-    # and will OOM a small host at boot. Enable only where there is memory headroom.
-    warmup_image_model_on_startup: bool = False
-
     model_config = SettingsConfigDict(
         env_file=".env",
         env_file_encoding="utf-8",
