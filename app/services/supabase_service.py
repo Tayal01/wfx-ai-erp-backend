@@ -4,18 +4,20 @@ from __future__ import annotations
 
 from concurrent.futures import ThreadPoolExecutor
 from datetime import date
+from decimal import Decimal
 from functools import lru_cache
 import time
 from typing import Any, Optional
 
+from sqlalchemy import text
 from supabase import Client, create_client
 
 from app.config.settings import get_settings
+from app.services.vanna_service import get_sql_engine
 
 
-DASHBOARD_SUMMARY_TTL_SECONDS = 30
+DASHBOARD_SUMMARY_TTL_SECONDS = 120
 PRODUCT_DETAIL_TTL_SECONDS = 120
-SUMMARY_QUERY_WORKERS = 6
 _dashboard_summary_cache: dict[str, Any] = {
     "value": None,
     "timestamp": 0.0,
@@ -120,64 +122,48 @@ def fetch_records(
 MONTHLY_TREND_MONTHS = 12
 
 
-def _shipment_month_key(raw: Any) -> str | None:
-    """Normalize a shipment_date to a 'YYYY-MM' bucket key. Tolerates ISO
-    dates, ISO datetimes ('...T..+00:00'/'Z'), None, empty, and garbage."""
-    if not raw:
-        return None
-    text = str(raw)[:10]  # 'YYYY-MM-DD' prefix works for date or datetime
-    try:
-        parsed = date.fromisoformat(text)
-    except ValueError:
-        return None
-    return f"{parsed.year:04d}-{parsed.month:02d}"
-
-
-def build_monthly_trend(
-    orders: list[dict[str, Any]],
-    months: int = MONTHLY_TREND_MONTHS,
-) -> list[dict[str, Any]]:
-    """Fold already-fetched sales orders into the last `months` calendar months
-    by shipment_date. Gaps pre-seeded with zeros. Oldest -> newest:
-    [{ "month": "YYYY-MM", "label": "Mon YY", "orders": int, "revenue": float }]"""
+def _monthly_skeleton(months: int = MONTHLY_TREND_MONTHS) -> dict[str, dict[str, Any]]:
+    """Ordered YYYY-MM buckets for the last `months` months, seeded with zeros."""
     today = date.today()
     base_index = today.year * 12 + (today.month - 1)
     start_index = base_index - (months - 1)
 
-    buckets: dict[str, dict[str, Any]] = {}
+    skeleton: dict[str, dict[str, Any]] = {}
     for offset in range(months):
         idx = start_index + offset
         year, month = idx // 12, idx % 12 + 1
         key = f"{year:04d}-{month:02d}"
-        buckets[key] = {
+        skeleton[key] = {
             "month": key,
             "label": date(year, month, 1).strftime("%b %y"),
             "orders": 0,
             "revenue": 0.0,
         }
+    return skeleton
 
-    for order in orders:
-        key = _shipment_month_key(order.get("shipment_date"))
-        if key is None:
-            continue
-        bucket = buckets.get(key)
-        if bucket is None:
-            continue
+
+def _fetch_rows(connection, sql: str) -> list[dict[str, Any]]:
+    return [dict(row) for row in connection.execute(text(sql)).mappings().all()]
+
+
+def _normalize_value(value: Any) -> Any:
+    if hasattr(value, "isoformat"):
         try:
-            qty = float(order.get("quantity") or 0)
-            price = float(order.get("unit_price") or 0)
-        except (TypeError, ValueError):
-            continue
-        bucket["orders"] += 1
-        bucket["revenue"] += qty * price
+            return value.isoformat()
+        except TypeError:
+            return str(value)
+    if isinstance(value, Decimal):
+        return float(value)
+    return value
 
-    trend = list(buckets.values())  # dict preserves insertion order (oldest->newest)
-    for bucket in trend:
-        bucket["revenue"] = round(bucket["revenue"], 2)
-    return trend
+
+def _normalize_rows(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    return [{key: _normalize_value(value) for key, value in row.items()} for row in rows]
 
 
 def get_dashboard_summary() -> dict[str, Any]:
+    """Aggregate the whole dashboard in SQL (GROUP BY / SUM) so the API never pulls
+    thousands of rows into memory. Cached briefly to absorb repeat loads."""
     now = time.time()
     cached_value = _dashboard_summary_cache["value"]
     cached_timestamp = _dashboard_summary_cache["timestamp"]
@@ -185,122 +171,101 @@ def get_dashboard_summary() -> dict[str, Any]:
     if cached_value and (now - cached_timestamp) < DASHBOARD_SUMMARY_TTL_SECONDS:
         return cached_value
 
-    with ThreadPoolExecutor(max_workers=SUMMARY_QUERY_WORKERS) as executor:
-        buyers_count_future = executor.submit(count_records, "buyers")
-        suppliers_count_future = executor.submit(count_records, "suppliers")
-        products_count_future = executor.submit(count_records, "finished_goods")
-        orders_count_future = executor.submit(count_records, "sales_orders")
-        invoices_count_future = executor.submit(count_records, "sales_invoices")
-        products_future = executor.submit(
-            list_records_selected,
-            "finished_goods",
-            "style_number,style_name,category",
-            1500,
+    with get_sql_engine().connect() as connection:
+        kpis = connection.execute(
+            text(
+                """
+                SELECT
+                    (SELECT COUNT(*) FROM buyers) AS buyers,
+                    (SELECT COUNT(*) FROM suppliers) AS suppliers,
+                    (SELECT COUNT(*) FROM finished_goods) AS finished_goods,
+                    (SELECT COUNT(*) FROM sales_orders) AS sales_orders,
+                    (SELECT COUNT(*) FROM sales_invoices) AS sales_invoices,
+                    (SELECT COALESCE(SUM(quantity * unit_price), 0) FROM sales_orders) AS order_revenue,
+                    (SELECT COALESCE(SUM(amount), 0) FROM sales_invoices) AS invoice_amount,
+                    (SELECT COALESCE(SUM(amount), 0) FROM sales_invoices
+                        WHERE lower(payment_status) <> 'paid') AS pending_invoice_amount
+                """
+            )
+        ).mappings().one()
+
+        categories = _fetch_rows(
+            connection,
+            "SELECT category, COUNT(*) AS count FROM finished_goods "
+            "GROUP BY category ORDER BY count DESC",
         )
-        orders_future = executor.submit(
-            list_records_selected,
-            "sales_orders",
-            "order_number,buyer,style_number,quantity,unit_price,status,shipment_date",
-            2500,
+        payment_status = _fetch_rows(
+            connection,
+            "SELECT payment_status AS status, COUNT(*) AS count FROM sales_invoices "
+            "GROUP BY payment_status ORDER BY payment_status",
         )
-        invoices_future = executor.submit(
-            list_records_selected,
-            "sales_invoices",
-            "amount,payment_status",
-            2500,
+        order_status = _fetch_rows(
+            connection,
+            "SELECT status, COUNT(*) AS count FROM sales_orders "
+            "GROUP BY status ORDER BY status",
         )
-        recent_orders_future = executor.submit(
-            fetch_records,
-            "sales_orders",
-            "order_number,buyer,style_number,quantity,status,shipment_date",
-            10,
-            "shipment_date",
-            True,
+        top_buyers = _fetch_rows(
+            connection,
+            "SELECT buyer, SUM(quantity * unit_price) AS revenue FROM sales_orders "
+            "GROUP BY buyer ORDER BY revenue DESC LIMIT 8",
         )
-        recent_products_future = executor.submit(
-            fetch_records,
-            "finished_goods",
-            "style_number,style_name,category,color,fabric,season,supplier",
-            10,
-            "created_at",
-            True,
+        monthly = _fetch_rows(
+            connection,
+            "SELECT to_char(date_trunc('month', shipment_date), 'YYYY-MM') AS month, "
+            "COUNT(*) AS orders, COALESCE(SUM(quantity * unit_price), 0) AS revenue "
+            "FROM sales_orders "
+            "WHERE shipment_date >= (date_trunc('month', CURRENT_DATE) - INTERVAL '11 months') "
+            "GROUP BY 1",
+        )
+        recent_orders = _fetch_rows(
+            connection,
+            "SELECT order_number, buyer, style_number, quantity, status, shipment_date "
+            "FROM sales_orders ORDER BY shipment_date DESC LIMIT 10",
+        )
+        recent_products = _fetch_rows(
+            connection,
+            "SELECT style_number, style_name, category, color, fabric, season, supplier "
+            "FROM finished_goods ORDER BY created_at DESC LIMIT 10",
         )
 
-        buyers_count = buyers_count_future.result()
-        suppliers_count = suppliers_count_future.result()
-        products_count = products_count_future.result()
-        orders_count = orders_count_future.result()
-        invoices_count = invoices_count_future.result()
-        products = products_future.result()
-        orders = orders_future.result()
-        invoices = invoices_future.result()
-        recent_orders = recent_orders_future.result()
-        recent_products = recent_products_future.result()
-
-    order_revenue = sum(float(order["quantity"]) * float(order["unit_price"]) for order in orders)
-    invoice_amount = sum(float(invoice["amount"]) for invoice in invoices)
-    pending_invoice_amount = sum(
-        float(invoice["amount"])
-        for invoice in invoices
-        if invoice["payment_status"].lower() != "paid"
-    )
-
-    category_counts: dict[str, int] = {}
-    for product in products:
-        category = product["category"]
-        category_counts[category] = category_counts.get(category, 0) + 1
-
-    payment_status_counts: dict[str, int] = {}
-    for invoice in invoices:
-        status = invoice["payment_status"]
-        payment_status_counts[status] = payment_status_counts.get(status, 0) + 1
-
-    top_buyers: dict[str, float] = {}
-    for order in orders:
-        buyer = order["buyer"]
-        revenue = float(order["quantity"]) * float(order["unit_price"])
-        top_buyers[buyer] = top_buyers.get(buyer, 0) + revenue
-
-    order_status_counts: dict[str, int] = {}
-    for order in orders:
-        status = order["status"]
-        order_status_counts[status] = order_status_counts.get(status, 0) + 1
-
-    monthly_trend = build_monthly_trend(orders)
+    skeleton = _monthly_skeleton()
+    for row in monthly:
+        bucket = skeleton.get(row["month"])
+        if bucket is not None:
+            bucket["orders"] = int(row["orders"] or 0)
+            bucket["revenue"] = round(float(row["revenue"] or 0), 2)
+    monthly_trend = list(skeleton.values())
 
     summary = {
         "kpis": {
-            "buyers": buyers_count,
-            "suppliers": suppliers_count,
-            "finished_goods": products_count,
-            "sales_orders": orders_count,
-            "sales_invoices": invoices_count,
-            "estimated_order_revenue": round(order_revenue, 2),
-            "invoice_amount": round(invoice_amount, 2),
-            "pending_invoice_amount": round(pending_invoice_amount, 2),
+            "buyers": int(kpis["buyers"] or 0),
+            "suppliers": int(kpis["suppliers"] or 0),
+            "finished_goods": int(kpis["finished_goods"] or 0),
+            "sales_orders": int(kpis["sales_orders"] or 0),
+            "sales_invoices": int(kpis["sales_invoices"] or 0),
+            "estimated_order_revenue": round(float(kpis["order_revenue"] or 0), 2),
+            "invoice_amount": round(float(kpis["invoice_amount"] or 0), 2),
+            "pending_invoice_amount": round(float(kpis["pending_invoice_amount"] or 0), 2),
         },
         "charts": {
             "product_categories": [
-                {"category": category, "count": count}
-                for category, count in sorted(category_counts.items(), key=lambda item: item[1], reverse=True)
+                {"category": row["category"], "count": int(row["count"])} for row in categories
             ],
             "payment_status": [
-                {"status": status, "count": count}
-                for status, count in sorted(payment_status_counts.items())
+                {"status": row["status"], "count": int(row["count"])} for row in payment_status
             ],
             "order_status": [
-                {"status": status, "count": count}
-                for status, count in sorted(order_status_counts.items())
+                {"status": row["status"], "count": int(row["count"])} for row in order_status
             ],
             "top_buyers": [
-                {"buyer": buyer, "revenue": round(revenue, 2)}
-                for buyer, revenue in sorted(top_buyers.items(), key=lambda item: item[1], reverse=True)[:8]
+                {"buyer": row["buyer"], "revenue": round(float(row["revenue"] or 0), 2)}
+                for row in top_buyers
             ],
             "monthly_trend": monthly_trend,
         },
         "recent": {
-            "orders": recent_orders,
-            "products": recent_products,
+            "orders": _normalize_rows(recent_orders),
+            "products": _normalize_rows(recent_products),
         },
     }
 

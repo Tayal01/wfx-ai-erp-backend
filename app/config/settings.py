@@ -9,9 +9,6 @@ class Settings(BaseSettings):
     app_version: str = "0.1.0"
     environment: str = "development"
     api_prefix: str = "/api"
-    jwt_secret_key: str = "change-this-local-development-secret"
-    jwt_algorithm: str = "HS256"
-    access_token_expire_minutes: int = 480
 
     demo_user_email: str = "merchandiser@wfx.com"
     demo_user_password: str = "demo1234"
