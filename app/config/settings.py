@@ -38,6 +38,10 @@ class Settings(BaseSettings):
 
     embedding_model_name: str = "clip-ViT-B-32"
 
+    # Preload CLIP + the NL->SQL store at boot so the first image/AI request is fast.
+    # Set false to trade a slow first request for lower idle memory.
+    warmup_models_on_startup: bool = True
+
     model_config = SettingsConfigDict(
         env_file=".env",
         env_file_encoding="utf-8",
