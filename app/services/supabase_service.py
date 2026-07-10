@@ -3,6 +3,7 @@ from __future__ import annotations
 """Supabase data access service."""
 
 from concurrent.futures import ThreadPoolExecutor
+from datetime import date
 from functools import lru_cache
 import time
 from typing import Any, Optional
@@ -116,6 +117,66 @@ def fetch_records(
     return response.data or []
 
 
+MONTHLY_TREND_MONTHS = 12
+
+
+def _shipment_month_key(raw: Any) -> str | None:
+    """Normalize a shipment_date to a 'YYYY-MM' bucket key. Tolerates ISO
+    dates, ISO datetimes ('...T..+00:00'/'Z'), None, empty, and garbage."""
+    if not raw:
+        return None
+    text = str(raw)[:10]  # 'YYYY-MM-DD' prefix works for date or datetime
+    try:
+        parsed = date.fromisoformat(text)
+    except ValueError:
+        return None
+    return f"{parsed.year:04d}-{parsed.month:02d}"
+
+
+def build_monthly_trend(
+    orders: list[dict[str, Any]],
+    months: int = MONTHLY_TREND_MONTHS,
+) -> list[dict[str, Any]]:
+    """Fold already-fetched sales orders into the last `months` calendar months
+    by shipment_date. Gaps pre-seeded with zeros. Oldest -> newest:
+    [{ "month": "YYYY-MM", "label": "Mon YY", "orders": int, "revenue": float }]"""
+    today = date.today()
+    base_index = today.year * 12 + (today.month - 1)
+    start_index = base_index - (months - 1)
+
+    buckets: dict[str, dict[str, Any]] = {}
+    for offset in range(months):
+        idx = start_index + offset
+        year, month = idx // 12, idx % 12 + 1
+        key = f"{year:04d}-{month:02d}"
+        buckets[key] = {
+            "month": key,
+            "label": date(year, month, 1).strftime("%b %y"),
+            "orders": 0,
+            "revenue": 0.0,
+        }
+
+    for order in orders:
+        key = _shipment_month_key(order.get("shipment_date"))
+        if key is None:
+            continue
+        bucket = buckets.get(key)
+        if bucket is None:
+            continue
+        try:
+            qty = float(order.get("quantity") or 0)
+            price = float(order.get("unit_price") or 0)
+        except (TypeError, ValueError):
+            continue
+        bucket["orders"] += 1
+        bucket["revenue"] += qty * price
+
+    trend = list(buckets.values())  # dict preserves insertion order (oldest->newest)
+    for bucket in trend:
+        bucket["revenue"] = round(bucket["revenue"], 2)
+    return trend
+
+
 def get_dashboard_summary() -> dict[str, Any]:
     now = time.time()
     cached_value = _dashboard_summary_cache["value"]
@@ -139,7 +200,7 @@ def get_dashboard_summary() -> dict[str, Any]:
         orders_future = executor.submit(
             list_records_selected,
             "sales_orders",
-            "order_number,buyer,style_number,quantity,unit_price,status",
+            "order_number,buyer,style_number,quantity,unit_price,status,shipment_date",
             2500,
         )
         invoices_future = executor.submit(
@@ -205,6 +266,8 @@ def get_dashboard_summary() -> dict[str, Any]:
         status = order["status"]
         order_status_counts[status] = order_status_counts.get(status, 0) + 1
 
+    monthly_trend = build_monthly_trend(orders)
+
     summary = {
         "kpis": {
             "buyers": buyers_count,
@@ -233,6 +296,7 @@ def get_dashboard_summary() -> dict[str, Any]:
                 {"buyer": buyer, "revenue": round(revenue, 2)}
                 for buyer, revenue in sorted(top_buyers.items(), key=lambda item: item[1], reverse=True)[:8]
             ],
+            "monthly_trend": monthly_trend,
         },
         "recent": {
             "orders": recent_orders,
