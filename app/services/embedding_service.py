@@ -6,7 +6,6 @@ from typing import Any, Optional
 
 import httpx
 from PIL import Image
-from sentence_transformers import SentenceTransformer
 
 from app.config.settings import get_settings
 
@@ -19,7 +18,11 @@ def get_embedding_status() -> str:
 
 
 @lru_cache
-def get_embedding_model() -> SentenceTransformer:
+def get_embedding_model():
+    # Imported lazily: sentence-transformers pulls in torch (~hundreds of MB),
+    # so the CLIP model only loads when image search is actually used.
+    from sentence_transformers import SentenceTransformer
+
     settings = get_settings()
     return SentenceTransformer(settings.embedding_model_name)
 
